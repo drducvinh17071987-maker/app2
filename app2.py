@@ -127,7 +127,7 @@ msg = res["msg"]
 s_color = res["s_color"]
 
 # =========================
-# MAIN LAYOUT: 2 COLUMNS (LEFT: cards, RIGHT: charts)
+# MAIN LAYOUT: 2 COLUMNS (LEFT: cards + HRV raw, RIGHT: charts 2 & 3)
 # =========================
 left, right = st.columns([1, 1], gap="large")
 
@@ -182,9 +182,8 @@ with left:
 
     st.caption("Single HRV signal · Time-dynamic processing · No ML · No absolute HRV threshold shown.")
 
-with right:
     # =========================
-    # 1) HRV RAW (FIXED ORDER)
+    # MOVE 1) HRV RAW HERE (UNDER 'Stable' MESSAGE)
     # =========================
     st.subheader("1) HRV raw")
     df_raw = pd.DataFrame({"Time": ["t-1", "t"], "HRV": [hrv_prev, hrv_curr]})
@@ -196,10 +195,11 @@ with right:
             x=alt.X("Time:N", sort=["t-1", "t"], title="Time"),
             y=alt.Y("HRV:Q", title="HRV (ms)", scale=alt.Scale(zero=False))
         )
-        .properties(height=210)
+        .properties(height=230)
     )
     st.altair_chart(chart_raw, use_container_width=True)
 
+with right:
     # =========================
     # 2) %HRV diverging bar
     # =========================
@@ -224,7 +224,7 @@ with right:
     ).encode(
         y="label:N", x="value:Q", text=alt.Text("value:Q", format="+.1f")
     )
-    st.altair_chart((bar + zero_line + txt).properties(height=110), use_container_width=True)
+    st.altair_chart((bar + zero_line + txt).properties(height=120), use_container_width=True)
 
     # =========================
     # 3) DN Sentinel bar (0–2) + labels + thresholds
@@ -281,7 +281,7 @@ with right:
         dy=-22, color="#333", fontSize=11, fontWeight="bold"
     ).encode(x="x:Q", y="y:N", text="t:N")
 
-    chart_dn = alt.layer(bg, fg, mid, t85, t95, val, lbl).properties(height=120)
+    chart_dn = alt.layer(bg, fg, mid, t85, t95, val, lbl).properties(height=130)
     st.altair_chart(chart_dn, use_container_width=True)
 
     st.caption("0–1: reserve contraction (DN core) · 1.0: neutral · 1–2: recovery (1 + TT⁺), TT = %HRV/80.")
