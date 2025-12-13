@@ -59,20 +59,18 @@ with left:
             else:
                 state, msg, s_color = "GREEN", "Stable", C_GREEN
 
-        # ===== UX fix: show DN only for DROP, show REC for RISE =====
+        # ===== REC for rise side (display only) =====
         if pct_hrv >= 0:
             if state == "INFO":
                 rec = 0.0
             else:
-                # simple bounded confidence on rise (not tied to DN)
-                rec = min(1.0, max(0.0, pct_hrv / NOISE_PCT))
-            dn_label = "REC"
-            dn_value = rec
+                rec = min(1.0, max(0.0, pct_hrv / NOISE_PCT))  # 0..1
         else:
-            dn_label = "DN"
-            dn_value = DN
+            rec = None
 
         st.session_state["result"] = dict(
+            hrv_prev=hrv_prev,
+            hrv_curr=hrv_curr,
             pct_hrv=pct_hrv,
             TT=TT,
             DN=DN,
@@ -80,9 +78,7 @@ with left:
             state=state,
             msg=msg,
             s_color=s_color,
-            dn_label=dn_label,
-            dn_value=dn_value,
-            rec=dn_value if dn_label == "REC" else None
+            rec=rec
         )
 
     res = st.session_state["result"]
@@ -96,10 +92,9 @@ with left:
     state = res["state"]
     msg = res["msg"]
     s_color = res["s_color"]
-    dn_label = res["dn_label"]
-    dn_value = res["dn_value"]
+    rec = res["rec"]
 
-    # ===== Big bold metrics =====
+    # ===== Left panel metrics (keep simple) =====
     st.markdown(
         f"""
         <div style="display:flex; gap:18px; align-items:flex-end; margin-top:10px;">
@@ -109,11 +104,9 @@ with left:
             <div style="font-size:12px; opacity:0.65;">ΔHRV = {delta_ms:+.1f} ms</div>
           </div>
           <div style="flex:1; padding:14px; border-radius:12px; background:{C_BG};">
-            <div style="font-size:12px; opacity:0.7;">{dn_label}</div>
-            <div style="font-size:34px; font-weight:800;">{dn_value:.3f}</div>
-            <div style="font-size:12px; opacity:0.65;">
-              {"(rise-side confidence)" if dn_label=="REC" else "(drop-side state)"}
-            </div>
+            <div style="font-size:12px; opacity:0.7;">DN (core)</div>
+            <div style="font-size:34px; font-weight:800;">{DN:.3f}</div>
+            <div style="font-size:12px; opacity:0.65;">(core value)</div>
           </div>
           <div style="flex:1; padding:14px; border-radius:12px; background:{s_color}; color:#111;">
             <div style="font-size:12px; font-weight:800; letter-spacing:0.5px;">STATE</div>
@@ -136,12 +129,14 @@ with left:
     st.caption("Single HRV signal. Time-dynamic processing. No ML. No absolute HRV threshold shown.")
 
 with right:
+    # Read again for charts
     res = st.session_state["result"]
+    hrv_prev = res["hrv_prev"]
+    hrv_curr = res["hrv_curr"]
     pct_hrv = res["pct_hrv"]
     DN = res["DN"]
     state = res["state"]
-    dn_label = res["dn_label"]
-    dn_value = res["dn_value"]
+    rec = res["rec"]
 
     # 1) HRV raw
     st.subheader("1) HRV raw")
@@ -177,10 +172,19 @@ with right:
     )
     st.altair_chart((bar + zero_line + text).properties(height=110), use_container_width=True)
 
-    # 3) DN/REC gauge
-    st.subheader(f"3) {dn_label} (state view)")
+    # 3) Unified sentinel bar (0..2)
+    st.subheader("3) Sentinel bar (0–2)")
 
-    # bar color based on overall STATE for clarity
+    # Map to one bar:
+    # - DROP: use DN in [0,1]
+    # - RISE: use 1 + REC in [1,2]
+    if pct_hrv >= 0:
+        rec_val = 0.0 if rec is None else rec
+        gauge_value = 1.0 + rec_val
+    else:
+        gauge_value = DN
+
+    # Color by STATE
     if state == "INFO":
         gauge_color = C_INFO
     elif state == "GREEN":
@@ -190,34 +194,29 @@ with right:
     else:
         gauge_color = C_RED
 
-    # background 0..1
-    bg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[1], "label":[dn_label]})).mark_bar(
+    bg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[2], "label":["bar"]})).mark_bar(
         color=C_BAR_BG, cornerRadius=8
     ).encode(
         y=alt.Y("label:N", title=""),
-        x=alt.X("x0:Q", scale=alt.Scale(domain=[0,1]), title=""),
+        x=alt.X("x0:Q", scale=alt.Scale(domain=[0,2]), title=""),
         x2="x1:Q"
     )
 
-    fg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[dn_value], "label":[dn_label]})).mark_bar(
+    fg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[gauge_value], "label":["bar"]})).mark_bar(
         color=gauge_color, cornerRadius=8
-    ).encode(
-        y="label:N",
-        x="x0:Q",
-        x2="x1:Q"
-    )
+    ).encode(y="label:N", x="x0:Q", x2="x1:Q")
 
-    layers = [bg, fg]
+    # Midline at 1.0
+    mid = alt.Chart(pd.DataFrame({"x":[1.0]})).mark_rule(color="#111", strokeWidth=2).encode(x="x:Q")
 
-    # Only show DN thresholds when dn_label == DN (drop-side)
-    if dn_label == "DN":
-        t85 = alt.Chart(pd.DataFrame({"x":[DN_RED]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
-        t95 = alt.Chart(pd.DataFrame({"x":[DN_GREEN]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
-        layers += [t85, t95]
+    # DN thresholds shown on left side only (still useful reference)
+    t85 = alt.Chart(pd.DataFrame({"x":[DN_RED]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
+    t95 = alt.Chart(pd.DataFrame({"x":[DN_GREEN]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
 
-    dn_text = alt.Chart(pd.DataFrame({"x":[dn_value], "label":[dn_label], "txt":[f"{dn_value:.3f}"]})).mark_text(
+    txt = alt.Chart(pd.DataFrame({"x":[gauge_value], "label":["bar"], "t":[f"{gauge_value:.3f}"]})).mark_text(
         align="left", dx=8, color="#111", fontSize=16, fontWeight="bold"
-    ).encode(y="label:N", x="x:Q", text="txt:N")
-    layers.append(dn_text)
+    ).encode(y="label:N", x="x:Q", text="t:N")
 
-    st.altair_chart(alt.layer(*layers).properties(height=110), use_container_width=True)
+    st.altair_chart((bg + fg + mid + t85 + t95 + txt).properties(height=110), use_container_width=True)
+
+    st.caption("0–1: drop reserve (DN). 1–2: recovery confidence (REC). Center=1.0 neutral.")
