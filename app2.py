@@ -9,9 +9,15 @@ st.title("HRV Sentinel demo")
 C_GREEN = "#00C853"   # vivid green
 C_YELLOW = "#FFD600"  # vivid yellow
 C_RED = "#D50000"     # vivid red
-C_GRAY = "#E0E0E0"
+C_GRAY = "#90A4AE"    # info / noise
+C_BG = "#11111108"
+C_BAR_BG = "#E0E0E0"
 
-# ==== State storage ====
+# ==== Noise-brake thresholds (tweakable if you want) ====
+NOISE_PCT = 70.0      # %HRV spike threshold
+NOISE_MS = 60.0       # absolute jump threshold (ms)
+
+# ==== Keep last results ====
 if "result" not in st.session_state:
     st.session_state["result"] = None
 
@@ -29,32 +35,47 @@ with left:
     do_calc = st.button("CALCULATE", type="primary")
 
     if do_calc:
-        # ===== KEEP ALGORITHM EXACTLY THE SAME =====
+        # ===== Compute (UNCHANGED) =====
         pct_hrv = 0.0 if hrv_prev == 0 else (hrv_curr - hrv_prev) / hrv_prev * 100.0  # %HRV (= %TT)
         TT = pct_hrv / 80.0
         DN = 1.0 - (TT ** 2)
-        DN = max(0.0, min(1.0, DN))  # clamp display only
+        DN = max(0.0, min(1.0, DN))  # clamp for display only
 
-        # ===== KEEP THRESHOLDS EXACTLY THE SAME =====
-        if DN < 0.85:
-            state = "RED"
-            msg = "Reserve collapsing – trigger recommended"
-            s_color = C_RED
-        elif DN < 0.95:
-            state = "YELLOW"
-            msg = "Load increasing"
-            s_color = C_YELLOW
+        delta_ms = hrv_curr - hrv_prev
+
+        # ===== State logic (SIGN-AWARE) =====
+        # Positive side: treat as recovery unless spike/noise
+        if pct_hrv >= 0:
+            if (pct_hrv >= NOISE_PCT) or (delta_ms >= NOISE_MS):
+                state = "INFO"
+                msg = "Possible spike / sensor noise"
+                s_color = C_GRAY
+            else:
+                state = "GREEN"
+                msg = "Recovery / rebound"
+                s_color = C_GREEN
         else:
-            state = "GREEN"
-            msg = "Stable"
-            s_color = C_GREEN
+            # Negative side: KEEP DN THRESHOLDS EXACTLY THE SAME
+            if DN < 0.85:
+                state = "RED"
+                msg = "Reserve collapsing – trigger recommended"
+                s_color = C_RED
+            elif DN < 0.95:
+                state = "YELLOW"
+                msg = "Load increasing"
+                s_color = C_YELLOW
+            else:
+                state = "GREEN"
+                msg = "Stable"
+                s_color = C_GREEN
 
         st.session_state["result"] = {
             "pct_hrv": pct_hrv,
             "DN": DN,
             "state": state,
             "msg": msg,
-            "s_color": s_color
+            "s_color": s_color,
+            "delta_ms": delta_ms
         }
 
     res = st.session_state["result"]
@@ -67,16 +88,18 @@ with left:
     state = res["state"]
     msg = res["msg"]
     s_color = res["s_color"]
+    delta_ms = res["delta_ms"]
 
-    # Big bold results (strong colors)
+    # Big bold results
     st.markdown(
         f"""
         <div style="display:flex; gap:18px; align-items:flex-end; margin-top:10px;">
-          <div style="flex:1; padding:14px; border-radius:12px; background:#11111108;">
+          <div style="flex:1; padding:14px; border-radius:12px; background:{C_BG};">
             <div style="font-size:12px; opacity:0.7;">%HRV</div>
             <div style="font-size:34px; font-weight:800;">{pct_hrv:+.1f}%</div>
+            <div style="font-size:12px; opacity:0.65;">ΔHRV = {delta_ms:+.1f} ms</div>
           </div>
-          <div style="flex:1; padding:14px; border-radius:12px; background:#11111108;">
+          <div style="flex:1; padding:14px; border-radius:12px; background:{C_BG};">
             <div style="font-size:12px; opacity:0.7;">DN</div>
             <div style="font-size:34px; font-weight:800;">{DN:.3f}</div>
           </div>
@@ -89,20 +112,26 @@ with left:
         unsafe_allow_html=True
     )
 
-    # Alert box (strong)
+    # Alert box
     if state == "RED":
         st.error(msg)
     elif state == "YELLOW":
         st.warning(msg)
+    elif state == "INFO":
+        st.info(msg)
     else:
         st.success(msg)
 
-    st.caption("Single physiological signal (HRV). Time-dynamic processing. No ML. No absolute HRV threshold shown.")
+    st.caption(
+        "Single physiological signal (HRV). Time-dynamic processing. No ML. "
+        "No absolute HRV threshold shown."
+    )
 
 with right:
     res = st.session_state["result"]
     pct_hrv = res["pct_hrv"]
     DN = res["DN"]
+    state = res["state"]
 
     # 1) HRV raw
     st.subheader("1) HRV raw")
@@ -121,7 +150,11 @@ with right:
     # 2) %HRV (=%TT) diverging bar centered at 0
     st.subheader("2) %HRV (=%TT linear velocity)")
     df_pct = pd.DataFrame({"label": ["%HRV"], "value": [pct_hrv]})
-    v_color = C_GREEN if pct_hrv >= 0 else C_RED
+
+    if pct_hrv >= 0:
+        v_color = C_GREEN if state != "INFO" else C_GRAY
+    else:
+        v_color = C_RED
 
     bar = (
         alt.Chart(df_pct)
@@ -146,14 +179,18 @@ with right:
 
     # 3) DN gauge-like bar (0→1)
     st.subheader("3) DN (state)")
-    if DN >= 0.95:
+
+    # Color DN bar by STATE (so INFO shows gray, recovery shows green)
+    if state == "INFO":
+        dn_color = C_GRAY
+    elif state == "GREEN":
         dn_color = C_GREEN
-    elif DN >= 0.85:
+    elif state == "YELLOW":
         dn_color = C_YELLOW
     else:
         dn_color = C_RED
 
-    bg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[1], "label":["DN"]})).mark_bar(color=C_GRAY, cornerRadius=8).encode(
+    bg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[1], "label":["DN"]})).mark_bar(color=C_BAR_BG, cornerRadius=8).encode(
         y=alt.Y("label:N", title=""),
         x=alt.X("x0:Q", scale=alt.Scale(domain=[0,1]), title=""),
         x2="x1:Q"
@@ -164,6 +201,7 @@ with right:
         x2="x1:Q"
     )
 
+    # Keep the reference markers (unchanged)
     t85 = alt.Chart(pd.DataFrame({"x":[0.85]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
     t95 = alt.Chart(pd.DataFrame({"x":[0.95]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
 
