@@ -5,7 +5,7 @@ import altair as alt
 st.set_page_config(page_title="HRV Sentinel Demo", layout="wide")
 st.title("HRV Sentinel demo")
 
-# ===== Colors (bold) =====
+# ===== Colors =====
 C_GREEN = "#00C853"
 C_YELLOW = "#FFD600"
 C_RED = "#D50000"
@@ -31,54 +31,62 @@ with left:
     with c1:
         hrv_prev = st.number_input("HRV (t-1) ms", value=20.0, step=1.0)
     with c2:
-        hrv_curr = st.number_input("HRV (t) ms", value=30.0, step=1.0)
+        hrv_curr = st.number_input("HRV (t) ms", value=22.0, step=1.0)
 
     do_calc = st.button("CALCULATE", type="primary")
 
     if do_calc:
         # ===== Core compute (UNCHANGED) =====
         pct_hrv = 0.0 if hrv_prev == 0 else (hrv_curr - hrv_prev) / hrv_prev * 100.0  # %HRV (= %TT)
-        TT = pct_hrv / 80.0
-        DN = 1.0 - (TT ** 2)
-        DN = max(0.0, min(1.0, DN))  # clamp display only
+        TT = pct_hrv / 80.0  # TT linear velocity (signed)
+        DN_core = 1.0 - (TT ** 2)
+        DN_core = max(0.0, min(1.0, DN_core))  # clamp for display
         delta_ms = hrv_curr - hrv_prev
 
-        # ===== State logic (SIGN-AWARE) =====
-        if pct_hrv >= 0:
-            # Recovery unless spike/noise
+        # ===== State logic =====
+        if pct_hrv > 0:
+            # rise side: Recovery unless spike/noise
             if (pct_hrv >= NOISE_PCT) or (delta_ms >= NOISE_MS):
                 state, msg, s_color = "INFO", "Possible spike / sensor noise", C_INFO
             else:
                 state, msg, s_color = "GREEN", "Recovery / rebound", C_GREEN
-        else:
-            # DROP side uses DN thresholds (KEEP)
-            if DN < DN_RED:
+        elif pct_hrv < 0:
+            # drop side uses DN thresholds (KEEP)
+            if DN_core < DN_RED:
                 state, msg, s_color = "RED", "Reserve collapsing – trigger recommended", C_RED
-            elif DN < DN_GREEN:
+            elif DN_core < DN_GREEN:
                 state, msg, s_color = "YELLOW", "Load increasing", C_YELLOW
             else:
                 state, msg, s_color = "GREEN", "Stable", C_GREEN
-
-        # ===== REC for rise side (display only) =====
-        if pct_hrv >= 0:
-            if state == "INFO":
-                rec = 0.0
-            else:
-                rec = min(1.0, max(0.0, pct_hrv / NOISE_PCT))  # 0..1
         else:
-            rec = None
+            # pct == 0
+            state, msg, s_color = "GREEN", "Stable", C_GREEN
+
+        # ===== DN canh gác (0–2) : ONE number that matches the bar =====
+        # - Drop: use DN_core in [0,1]
+        # - Neutral: 1.0
+        # - Rise: 1 + TT_pos (TT derived from %HRV), clamp TT_pos to [0,1]
+        if pct_hrv > 0 and state != "INFO":
+            TT_pos = max(0.0, min(1.0, TT))   # TT already computed from %HRV
+            DN_guard = 1.0 + TT_pos           # 1..2
+        elif pct_hrv > 0 and state == "INFO":
+            DN_guard = 1.0                    # keep neutral on noise
+        elif pct_hrv == 0:
+            DN_guard = 1.0
+        else:
+            DN_guard = DN_core                 # 0..1 on drop
 
         st.session_state["result"] = dict(
             hrv_prev=hrv_prev,
             hrv_curr=hrv_curr,
             pct_hrv=pct_hrv,
             TT=TT,
-            DN=DN,
+            DN_core=DN_core,
+            DN_guard=DN_guard,
             delta_ms=delta_ms,
             state=state,
             msg=msg,
-            s_color=s_color,
-            rec=rec
+            s_color=s_color
         )
 
     res = st.session_state["result"]
@@ -87,14 +95,13 @@ with left:
         st.stop()
 
     pct_hrv = res["pct_hrv"]
-    DN = res["DN"]
+    DN_guard = res["DN_guard"]
     delta_ms = res["delta_ms"]
     state = res["state"]
     msg = res["msg"]
     s_color = res["s_color"]
-    rec = res["rec"]
 
-    # ===== Left panel metrics (keep simple) =====
+    # ===== Left panel metrics (only ONE number for DN) =====
     st.markdown(
         f"""
         <div style="display:flex; gap:18px; align-items:flex-end; margin-top:10px;">
@@ -104,9 +111,9 @@ with left:
             <div style="font-size:12px; opacity:0.65;">ΔHRV = {delta_ms:+.1f} ms</div>
           </div>
           <div style="flex:1; padding:14px; border-radius:12px; background:{C_BG};">
-            <div style="font-size:12px; opacity:0.7;">DN (core)</div>
-            <div style="font-size:34px; font-weight:800;">{DN:.3f}</div>
-            <div style="font-size:12px; opacity:0.65;">(core value)</div>
+            <div style="font-size:12px; opacity:0.7;">DN canh gác (0–2)</div>
+            <div style="font-size:34px; font-weight:800;">{DN_guard:.3f}</div>
+            <div style="font-size:12px; opacity:0.65;">(same value as the bar)</div>
           </div>
           <div style="flex:1; padding:14px; border-radius:12px; background:{s_color}; color:#111;">
             <div style="font-size:12px; font-weight:800; letter-spacing:0.5px;">STATE</div>
@@ -129,14 +136,12 @@ with left:
     st.caption("Single HRV signal. Time-dynamic processing. No ML. No absolute HRV threshold shown.")
 
 with right:
-    # Read again for charts
     res = st.session_state["result"]
     hrv_prev = res["hrv_prev"]
     hrv_curr = res["hrv_curr"]
     pct_hrv = res["pct_hrv"]
-    DN = res["DN"]
+    DN_guard = res["DN_guard"]
     state = res["state"]
-    rec = res["rec"]
 
     # 1) HRV raw
     st.subheader("1) HRV raw")
@@ -172,17 +177,8 @@ with right:
     )
     st.altair_chart((bar + zero_line + text).properties(height=110), use_container_width=True)
 
-    # 3) Unified sentinel bar (0..2)
-    st.subheader("3) Sentinel bar (0–2)")
-
-    # Map to one bar:
-    # - DROP: use DN in [0,1]
-    # - RISE: use 1 + REC in [1,2]
-    if pct_hrv >= 0:
-        rec_val = 0.0 if rec is None else rec
-        gauge_value = 1.0 + rec_val
-    else:
-        gauge_value = DN
+    # 3) DN canh gác (0..2) - one bar, same number as shown above
+    st.subheader("3) DN canh gác (0–2)")
 
     # Color by STATE
     if state == "INFO":
@@ -202,21 +198,21 @@ with right:
         x2="x1:Q"
     )
 
-    fg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[gauge_value], "label":["bar"]})).mark_bar(
+    fg = alt.Chart(pd.DataFrame({"x0":[0], "x1":[DN_guard], "label":["bar"]})).mark_bar(
         color=gauge_color, cornerRadius=8
     ).encode(y="label:N", x="x0:Q", x2="x1:Q")
 
-    # Midline at 1.0
+    # Midline at 1.0 (neutral)
     mid = alt.Chart(pd.DataFrame({"x":[1.0]})).mark_rule(color="#111", strokeWidth=2).encode(x="x:Q")
 
-    # DN thresholds shown on left side only (still useful reference)
+    # DN thresholds shown on left side (drop reference)
     t85 = alt.Chart(pd.DataFrame({"x":[DN_RED]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
     t95 = alt.Chart(pd.DataFrame({"x":[DN_GREEN]})).mark_rule(color="#444", strokeDash=[5,5], strokeWidth=2).encode(x="x:Q")
 
-    txt = alt.Chart(pd.DataFrame({"x":[gauge_value], "label":["bar"], "t":[f"{gauge_value:.3f}"]})).mark_text(
+    txt = alt.Chart(pd.DataFrame({"x":[DN_guard], "label":["bar"], "t":[f"{DN_guard:.3f}"]})).mark_text(
         align="left", dx=8, color="#111", fontSize=16, fontWeight="bold"
     ).encode(y="label:N", x="x:Q", text="t:N")
 
     st.altair_chart((bg + fg + mid + t85 + t95 + txt).properties(height=110), use_container_width=True)
 
-    st.caption("0–1: drop reserve (DN). 1–2: recovery confidence (REC). Center=1.0 neutral.")
+    st.caption("0–1: DN (drop). 1.0: neutral. 1–2: 1 + TT(+) (recovery).")
