@@ -1,293 +1,295 @@
-# app2.py
-# DN v2 Demo – Table (HRV / SpO2 / RR / HR) – clean for paper
-# Core: pct_step -> T -> E=1-T^2 -> vT/vE ; scientific status/note
-
-import math
 import re
-from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# =========================
+# Core parsing / computation
+# =========================
+
 def parse_series(text: str) -> List[float]:
     """
-    Parse a whitespace/comma/semicolon separated list of numbers.
+    Parse a user-entered numeric series.
+    Accepts spaces, commas, semicolons, newlines.
     """
-    if text is None:
+    if not text or not text.strip():
         return []
-    cleaned = re.sub(r"[,\;\t]+", " ", text.strip())
-    parts = [p for p in cleaned.split(" ") if p != ""]
+    parts = re.split(r"[,\s;]+", text.strip())
     vals = []
     for p in parts:
-        try:
-            vals.append(float(p))
-        except:
-            pass
+        if p == "":
+            continue
+        vals.append(float(p))
     return vals
 
 
-def safe_pct_step(values: np.ndarray) -> np.ndarray:
+def safe_pct_step(prev: float, cur: float) -> float:
     """
-    pct_step[i] = 100*(x_i - x_{i-1})/x_{i-1}, with pct_step[0]=0.
-    Protect divide-by-zero.
+    pct_step = 100*(cur - prev)/prev
+    - If prev == 0 -> return 0 (avoid division blow-up).
     """
-    pct = np.zeros(len(values), dtype=float)
-    for i in range(1, len(values)):
-        prev = values[i - 1]
-        if prev == 0:
-            pct[i] = 0.0
-        else:
-            pct[i] = 100.0 * (values[i] - prev) / prev
-    return pct
+    if prev == 0:
+        return 0.0
+    return 100.0 * (cur - prev) / prev
 
 
-def lorentz_from_pct(pct_step: np.ndarray, k: float) -> Tuple[np.ndarray, np.ndarray]:
+def compute_table(values: List[float], K: float) -> pd.DataFrame:
     """
-    T = pct_step / k  (IMPORTANT: pct_step is already in %, DO NOT divide by 100 again)
-    E = 1 - T^2
+    Compute the DN-dynamic table:
+    pct_step -> T -> E -> vT/vE
     """
-    T = pct_step / float(k)
-    E = 1.0 - np.square(T)
-    return T, E
-
-
-def velocity(arr: np.ndarray) -> np.ndarray:
-    """
-    v[i] = arr[i] - arr[i-1], v[0]=0
-    """
-    v = np.zeros(len(arr), dtype=float)
-    v[1:] = arr[1:] - arr[:-1]
-    return v
-
-
-def is_vshape(pct_step: np.ndarray, i: int,
-              d1_thr: float, d2_thr: float, total_abs_thr: float) -> bool:
-    """
-    V-shape pattern over two steps: i is down-step, i+1 is recovery-step.
-    Conditions:
-      pct_step[i] <= d1_thr (negative)
-      pct_step[i+1] >= d2_thr (positive)
-      abs(pct_step[i] + pct_step[i+1]) <= total_abs_thr
-    """
-    if i < 1 or i + 1 >= len(pct_step):
-        return False
-    return (pct_step[i] <= d1_thr) and (pct_step[i + 1] >= d2_thr) and (abs(pct_step[i] + pct_step[i + 1]) <= total_abs_thr)
-
-
-def note_by_absT(absT: float) -> str:
-    """
-    For threshold-based systems (SpO2/RR/HR):
-      |T| >= 0.6 -> RED
-      |T| >= 0.3 -> WARNING
-      |T| >= 0.2 -> MILD
-      else GREEN
-    """
-    if absT >= 0.6:
-        return "RED"
-    if absT >= 0.3:
-        return "WARNING"
-    if absT >= 0.2:
-        return "MILD"
-    return "GREEN"
-
-
-# -----------------------------
-# HRV logic (pattern-based, baseline-free)
-# -----------------------------
-def compute_hrv(values: List[float]) -> pd.DataFrame:
-    """
-    HRV: no absolute threshold.
-    Use pattern shape:
-      - noise-brake: step >= +70% OR abs(delta)>=60ms => INFO
-      - V-shape: d1<=-20, d2>=+15, |total|<=12 => INFO
-      - step-drop: any step<=-40% => RED
-      - drift-down: last 3 steps all negative and total<=-15% => WARNING
-      - else GREEN
-    status:
-      BASE for first row OR pct_step==0; else PATTERN
-    """
-    x = np.array(values, dtype=float)
-    n = len(x)
+    n = len(values)
     if n == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["minute", "value", "pct_step", "t", "e", "vT", "vE", "status", "note"])
 
-    pct = safe_pct_step(x)
-
-    # DN core (as you locked): K=80 for HRV dynamic
-    T, E = lorentz_from_pct(pct, k=80.0)
-    vT = velocity(T)
-    vE = velocity(E)
-
-    status = []
-    note = [""] * n
-
-    # status: BASE if first row or no change
-    for i in range(n):
-        if i == 0 or abs(pct[i]) < 1e-12:
-            status.append("BASE")
-        else:
-            status.append("PATTERN")
-
-    # pattern detection
-    # 1) noise-brake (sensor noise / posture artifact)
+    pct = [0.0]
     for i in range(1, n):
-        delta = x[i] - x[i - 1]
-        if (pct[i] >= 70.0) or (abs(delta) >= 60.0):
-            note[i] = "INFO: possible sensor noise (noise-brake)"
+        pct.append(safe_pct_step(values[i - 1], values[i]))
 
-    # 2) V-shape recovery override (apply to recovery point i+1)
+    pct = np.array(pct, dtype=float)
+    T = pct / float(K)
+    E = 1.0 - (T ** 2)
+
+    vT = np.zeros(n, dtype=float)
+    vE = np.zeros(n, dtype=float)
+    vT[1:] = T[1:] - T[:-1]
+    vE[1:] = E[1:] - E[:-1]
+
+    minute = np.arange(1, n + 1)
+    status = np.array(["BASE" if i < 2 else "PATTERN" for i in range(n)], dtype=object)
+
+    df = pd.DataFrame(
+        {
+            "minute": minute,
+            "value": np.array(values, dtype=float),
+            "pct_step": pct,
+            "t": T,
+            "e": E,
+            "vT": vT,
+            "vE": vE,
+            "status": status,
+            "note": np.array([""] * n, dtype=object),
+        }
+    )
+    return df
+
+
+# =========================
+# Pattern labeling (NOTES)
+# =========================
+
+@dataclass
+class VShapeRule:
+    drop_pct: float            # pct_step <= -drop_pct
+    rebound_pct: float         # next pct_step >= +rebound_pct
+    net_abs_pct: float         # abs(net change over 2 steps) <= net_abs_pct
+    # net change is from i-1 to i+1, normalized by value[i-1]
+
+
+def apply_vshape_info(df: pd.DataFrame, rule: VShapeRule) -> np.ndarray:
+    """
+    Mark V-shape points as INFO when:
+      pct_step[i] <= -drop_pct AND pct_step[i+1] >= rebound_pct AND
+      abs(net_2step_pct) <= net_abs_pct
+    Returns boolean mask length n (True means "this point is part of V-shape").
+    """
+    n = len(df)
+    mark = np.zeros(n, dtype=bool)
+    if n < 3:
+        return mark
+
+    vals = df["value"].values
+    pct = df["pct_step"].values
+
     for i in range(1, n - 1):
-        if is_vshape(pct, i, d1_thr=-20.0, d2_thr=15.0, total_abs_thr=12.0):
-            # mark recovery point as INFO
-            note[i + 1] = "INFO: V-shape recovery (transient drop)"
+        if pct[i] <= -abs(rule.drop_pct) and pct[i + 1] >= abs(rule.rebound_pct):
+            prev = vals[i - 1]
+            if prev != 0:
+                net_2step = 100.0 * (vals[i + 1] - prev) / prev
+            else:
+                net_2step = 0.0
+            if abs(net_2step) <= abs(rule.net_abs_pct):
+                mark[i] = True
+                mark[i + 1] = True
+    return mark
 
-    # 3) step-drop RED (true abrupt drop)
-    for i in range(1, n):
-        if pct[i] <= -40.0 and note[i] == "":
-            note[i] = "RED: step-drop (<= -40%)"
 
-    # 4) drift-down WARNING (persistent decline)
+def label_hrv_notes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    HRV: no absolute threshold. Use shape only:
+    - V-shape recovery => INFO
+    - Noise spike (very large up-step) => INFO
+    - Sustained drift-down => WARNING/RED
+    - Otherwise => GREEN
+    """
+    n = len(df)
+    notes = np.array(["GREEN"] * n, dtype=object)
+
+    # BASE rows: keep GREEN (but you still get computed rows)
+    # (you can change BASE note to "" if you prefer, but you said "note trống là sao" => keep non-empty)
+    # V-shape (your spirit): drop then rebound, net small
+    vmask = apply_vshape_info(df, VShapeRule(drop_pct=20.0, rebound_pct=15.0, net_abs_pct=12.0))
+    notes[vmask] = "INFO"  # recovery / transient
+
+    pct = df["pct_step"].values
+
+    # Noise-brake: too-fast rise (sensor spike) -> INFO (and override GREEN)
+    # (matches your v1.5 idea but kept minimal and deterministic)
+    noise = (pct >= 70.0) | (np.abs(df["value"].diff().fillna(0.0).values) >= 60.0)
+    notes[noise] = "INFO"
+
+    # Drift-down detection: 3 consecutive negative steps
+    # Severity based on cumulative drop over the last 4 points
+    vals = df["value"].values
     for i in range(3, n):
-        last3 = pct[i-2:i+1]
-        total3 = float(np.sum(last3))
-        if np.all(last3 < 0) and total3 <= -15.0:
-            if note[i] == "":
-                note[i] = "WARNING: drift-down (3-step negative)"
+        if (pct[i] < 0) and (pct[i - 1] < 0) and (pct[i - 2] < 0):
+            base = vals[i - 3]
+            if base != 0:
+                total = 100.0 * (vals[i] - base) / base
+            else:
+                total = 0.0
+            if total <= -30.0:
+                notes[i] = "RED"
+            elif total <= -15.0:
+                notes[i] = "WARNING"
+            else:
+                notes[i] = "MILD"
 
-    # 5) fill empty notes with GREEN (for paper consistency)
-    for i in range(n):
-        if note[i] == "":
-            note[i] = "GREEN"
+    # Do not overwrite INFO (INFO has priority for false-alarm / recovery patterns)
+    # Priority: INFO > RED > WARNING > MILD > GREEN
+    # We'll enforce by re-applying INFO at the end:
+    notes[vmask | noise] = "INFO"
 
-    df = pd.DataFrame({
-        "minute": list(range(1, n + 1)),
-        "value": x,
-        "pct_step": pct,
-        "t": T,
-        "e": E,
-        "vT": vT,
-        "vE": vE,
-        "status": status,
-        "note": note
-    })
+    df["note"] = notes
     return df
 
 
-# -----------------------------
-# Threshold-based logic (SpO2 / RR / HR) + V-shape INFO override
-# -----------------------------
-def compute_threshold_system(values: List[float], k: float, label: str) -> pd.DataFrame:
+def label_threshold_notes(df: pd.DataFrame, *,
+                          red_T: float,
+                          warn_T: float,
+                          mild_T: float,
+                          vshape_rule: VShapeRule) -> pd.DataFrame:
     """
-    Generic for SpO2/RR/HR:
-      pct_step -> T=pct/k ; E=1-T^2 ; vT/vE
-      note by |T| (RED/WARNING/MILD/GREEN)
-      V-shape: (down then recover quickly) => INFO at recovery point
-        use same V-shape rule: d1<=-20, d2>=+15, |total|<=12  (in pct domain)
-      status: BASE for first row OR pct_step==0 else PATTERN
+    Systems with thresholds (SpO2/RR/HR):
+    - Use |T| thresholds to set GREEN/MILD/WARNING/RED
+    - If V-shape (drop then rebound, net small) => INFO overrides severity (false alarm filter)
     """
-    x = np.array(values, dtype=float)
-    n = len(x)
-    if n == 0:
-        return pd.DataFrame()
+    n = len(df)
+    notes = np.array(["GREEN"] * n, dtype=object)
 
-    pct = safe_pct_step(x)
-    T, E = lorentz_from_pct(pct, k=k)
-    vT = velocity(T)
-    vE = velocity(E)
+    T = df["t"].values
+    aT = np.abs(T)
 
-    status = []
-    note = [""] * n
-    for i in range(n):
-        if i == 0 or abs(pct[i]) < 1e-12:
-            status.append("BASE")
-        else:
-            status.append("PATTERN")
+    notes[aT >= mild_T] = "MILD"
+    notes[aT >= warn_T] = "WARNING"
+    notes[aT >= red_T] = "RED"
 
-    # Base threshold note
-    for i in range(n):
-        if i == 0:
-            note[i] = "GREEN"
-        else:
-            note[i] = note_by_absT(abs(float(T[i])))
+    # V-shape override => INFO
+    vmask = apply_vshape_info(df, vshape_rule)
+    notes[vmask] = "INFO"
 
-    # V-shape override (apply INFO to recovery point only)
-    for i in range(1, n - 1):
-        if is_vshape(pct, i, d1_thr=-20.0, d2_thr=15.0, total_abs_thr=12.0):
-            note[i + 1] = "INFO: V-shape recovery (transient)"
-
-    df = pd.DataFrame({
-        "minute": list(range(1, n + 1)),
-        "value": x,
-        "pct_step": pct,
-        "t": T,
-        "e": E,
-        "vT": vT,
-        "vE": vE,
-        "status": status,
-        "note": note
-    })
+    df["note"] = notes
     return df
 
 
-# -----------------------------
+# =========================
 # Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="DN v2 Demo – Table", layout="wide")
-st.title("DN v2 Demo – Table (HRV / SpO2 / RR / HR)")
+# =========================
 
-tabs = st.tabs(["HRV", "SpO2", "RR", "HR"])
+st.set_page_config(page_title="DN v2 Demo (4 tabs)", layout="wide")
 
-# Defaults (you can change the example strings anytime)
-default_hrv = "50 49 48 33 32 31 44 43 42 41"
-default_spo2 = "98 97 96 77 94 93 92 91 90 89"
-default_rr = "16 16 17 33 17 16 15 16 15 16"
-default_hr = "70 71 72 123 86 85 84 83 82 81"
+st.title("DN v2 Demo — 4 tabs (HRV / SpO2 / RR / HR)")
+st.caption("Blank input by default. Paste a series, press Compute, export CSV.")
 
-# Internal constants (NOT shown in UI to keep paper clean)
-K_HRV = 80.0
-K_SPO2 = 5.0     # matches your screenshot: T ≈ (%ΔSpO2)/5
-K_RR = 25.0      # you locked: K_rr=25 (%ΔRR per min)
-K_HR = 25.0      # consistent with your screenshot: T ≈ (%ΔHR)/25
+tab_hrv, tab_spo2, tab_rr, tab_hr = st.tabs(["HRV", "SpO2", "RR", "HR"])
 
 
-def render_tab(tab_name: str, default_text: str, compute_fn):
-    with st.container():
-        st.subheader(f"{tab_name} (10 points)")
-        text = st.text_input(f"{tab_name} series", value=default_text, key=f"in_{tab_name}")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            run = st.button("Compute", key=f"btn_{tab_name}")
-        df = None
-        if run:
-            vals = parse_series(text)
-            if len(vals) < 2:
-                st.error("Please input at least 2 points.")
+def render_tab(tab, title: str, K: float, mode: str):
+    with tab:
+        st.subheader(f"{title} (dynamic, 10+ points recommended)")
+        series_text = st.text_input(f"{title} series", value="", placeholder="e.g. 48 47 46 45 28 27 26 26 25 25", key=f"{mode}_series")
+
+        if st.button("Compute", key=f"{mode}_btn"):
+            values = parse_series(series_text)
+
+            if len(values) < 2:
+                st.warning("Please input at least 2 numbers.")
                 return
-            df = compute_fn(vals)
 
-            st.dataframe(df, use_container_width=True)
+            df = compute_table(values, K=K)
 
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", data=csv, file_name=f"{tab_name.lower()}_dn_table.csv", mime="text/csv")
+            # Apply notes
+            if mode == "hrv":
+                df = label_hrv_notes(df)
+
+            elif mode == "spo2":
+                # SpO2: use |T| thresholds and V-shape INFO
+                # K=5 makes 3% step -> |T|=0.6 (RED) as your spirit example.
+                df = label_threshold_notes(
+                    df,
+                    red_T=0.6,
+                    warn_T=0.3,
+                    mild_T=0.2,
+                    vshape_rule=VShapeRule(drop_pct=3.0, rebound_pct=2.0, net_abs_pct=1.0),
+                )
+
+            elif mode == "rr":
+                # RR mapping you wrote (per minute):
+                # 25% -> |T|=1 (RED), 12-15% -> |T|~0.5 (WARNING), 5-8% -> |T|~0.2-0.3 (MILD)
+                df = label_threshold_notes(
+                    df,
+                    red_T=1.0,
+                    warn_T=0.5,
+                    mild_T=0.2,
+                    vshape_rule=VShapeRule(drop_pct=25.0, rebound_pct=12.0, net_abs_pct=5.0),
+                )
+
+            elif mode == "hr":
+                # HR: treat as % dynamics (same K=25 as RR for demo consistency),
+                # but keep thresholded notes + V-shape INFO so “spike then recover” won't stay RED.
+                df = label_threshold_notes(
+                    df,
+                    red_T=1.0,
+                    warn_T=0.5,
+                    mild_T=0.2,
+                    vshape_rule=VShapeRule(drop_pct=25.0, rebound_pct=12.0, net_abs_pct=8.0),
+                )
+
+            # Display
+            show_cols = ["minute", "value", "pct_step", "t", "e", "vT", "vE", "status", "note"]
+            st.dataframe(df[show_cols], use_container_width=True)
+
+            csv = df[show_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv,
+                file_name=f"{mode}_dn_v2.csv",
+                mime="text/csv",
+                key=f"{mode}_csv",
+            )
+
+        # Minimal scientific note (short and clean)
+        with st.expander("Scientific note (what is computed)"):
+            st.markdown(
+                f"""
+- **pct_step** = 100×(xᵢ − xᵢ₋₁) / xᵢ₋₁, first point = 0  
+- **T** = pct_step / **K** (here K={K:g})  
+- **E** = 1 − T²  
+- **vT** = Tᵢ − Tᵢ₋₁, **vE** = Eᵢ − Eᵢ₋₁  
+- **status**: BASE for first 2 rows, PATTERN afterwards  
+- **note**:  
+  - HRV: shape-based (drift / V-shape / noise)  
+  - SpO2/RR/HR: |T|-threshold + V-shape ⇒ INFO (false-alarm filter)
+"""
+            )
 
 
-# HRV
-with tabs[0]:
-    render_tab("HRV", default_hrv, compute_hrv)
-
-# SpO2
-with tabs[1]:
-    render_tab("SpO2", default_spo2, lambda v: compute_threshold_system(v, k=K_SPO2, label="SpO2"))
-
-# RR
-with tabs[2]:
-    render_tab("RR", default_rr, lambda v: compute_threshold_system(v, k=K_RR, label="RR"))
-
-# HR
-with tabs[3]:
-    render_tab("HR", default_hr, lambda v: compute_threshold_system(v, k=K_HR, label="HR"))
+# Constants (fixed, no extra sliders/inputs)
+render_tab(tab_hrv, "HRV", K=80.0, mode="hrv")
+render_tab(tab_spo2, "SpO2", K=5.0, mode="spo2")
+render_tab(tab_rr, "RR", K=25.0, mode="rr")
+render_tab(tab_hr, "HR", K=25.0, mode="hr")
