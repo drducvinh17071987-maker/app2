@@ -1,287 +1,407 @@
-import streamlit as st
+import numpy as np
 import pandas as pd
-import altair as alt
+import streamlit as st
+import plotly.graph_objects as go
 
-# =========================
-# PAGE
-# =========================
-st.set_page_config(page_title="HRV DN Sentinel Demo", layout="wide")
+st.set_page_config(page_title="DN v2 Demo (4 Systems, 10 points)", layout="wide")
 
-# =========================
-# DESIGN CONSTANTS
-# =========================
-K = 80.0  # unified constant: TT = %HRV / 80, and noise threshold = 80%
+# -------------------------
+# Helpers
+# -------------------------
+def parse_series(text: str, n_expected: int = 10):
+    """Parse space/comma/newline separated numbers. Returns list[float] length n_expected or raises ValueError."""
+    if text is None:
+        raise ValueError("Empty input.")
+    cleaned = text.replace(",", " ").replace(";", " ").replace("\n", " ").strip()
+    parts = [p for p in cleaned.split(" ") if p.strip() != ""]
+    vals = []
+    for p in parts:
+        vals.append(float(p))
+    if len(vals) != n_expected:
+        raise ValueError(f"Need exactly {n_expected} numbers, got {len(vals)}.")
+    return vals
 
-C_GREEN = "#00C853"
-C_YELLOW = "#FFD600"
-C_RED = "#D50000"
-C_INFO = "#90A4AE"
-C_BAR_BG = "#E0E0E0"
-C_CARD_BG = "#11111108"
+def pct_change(x_prev, x_cur):
+    if x_prev == 0:
+        return np.nan
+    return 100.0 * (x_cur - x_prev) / x_prev
 
-DN_GREEN = 0.95
-DN_RED = 0.85
-
-# =========================
-# HELPERS
-# =========================
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def compute_state(pct_hrv: float, delta_ms: float, dn_core: float):
+def dn_table_from_pct(pct_series, k):
     """
-    State logic:
-    - Rise side: GREEN unless spike/noise (INFO). Noise uses K=80% (unified).
-    - Drop side: uses DN thresholds (0.95, 0.85).
+    pct_series: list length N, where pct_series[i] is %Δ at minute i (minute 1 = 0 or NaN)
+    T = pct/k
+    E = 1 - T^2
+    vT = T[i] - T[i-1]
+    vE = E[i] - E[i-1]
     """
-    if pct_hrv >= K:
-        return "INFO", "Possible spike / sensor noise", C_INFO
-    if pct_hrv > 0:
-        return "GREEN", "Recovery / rebound", C_GREEN
-    if pct_hrv < 0:
-        if dn_core < DN_RED:
-            return "RED", "Reserve collapsing – trigger recommended", C_RED
-        if dn_core < DN_GREEN:
-            return "YELLOW", "Load increasing", C_YELLOW
-        return "GREEN", "Stable", C_GREEN
-    return "GREEN", "Stable", C_GREEN
+    T = np.array(pct_series, dtype=float) / float(k)
+    E = 1.0 - (T ** 2)
+    vT = np.full_like(T, np.nan, dtype=float)
+    vE = np.full_like(E, np.nan, dtype=float)
+    for i in range(1, len(T)):
+        vT[i] = T[i] - T[i - 1]
+        vE[i] = E[i] - E[i - 1]
+    return T, E, vT, vE
 
-# =========================
-# TITLE
-# =========================
-st.title("HRV Sentinel demo")
+def status_from_absT(absT):
+    """Generic thresholds used for RR/HR: INFO>=0.2, WARNING>=0.5, RED>=1.0"""
+    if np.isnan(absT):
+        return "—"
+    if absT >= 1.0:
+        return "RED"
+    if absT >= 0.5:
+        return "WARNING"
+    if absT >= 0.2:
+        return "INFO"
+    return "GREEN"
 
-# =========================
-# INPUTS (TOP, 2 COLUMNS)
-# =========================
-in1, in2 = st.columns([1, 1], gap="large")
-with in1:
-    hrv_prev = st.number_input("HRV (t-1) ms", value=20.0, step=1.0)
-with in2:
-    hrv_curr = st.number_input("HRV (t) ms", value=22.0, step=1.0)
+def status_from_absT_spo2(absT):
+    """SpO2 thresholds: WARNING>=0.3, RED>=0.6"""
+    if np.isnan(absT):
+        return "—"
+    if absT >= 0.6:
+        return "RED"
+    if absT >= 0.3:
+        return "WARNING"
+    return "GREEN"
 
-do_calc = st.button("CALCULATE", type="primary")
-
-if "res" not in st.session_state:
-    st.session_state["res"] = None
-
-if do_calc:
-    # =========================
-    # CORE COMPUTE
-    # =========================
-    delta_ms = hrv_curr - hrv_prev
-    pct_hrv = 0.0 if hrv_prev == 0 else 100.0 * delta_ms / hrv_prev  # %HRV
-
-    # TT signed, unified constant
-    TT_signed = pct_hrv / K
-    TT_abs = abs(TT_signed)
-
-    # DN core (drop-side), clamp for display
-    DN_core = 1.0 - (TT_abs ** 2)
-    DN_core = clamp(DN_core, 0.0, 1.0)
-
-    # State
-    state, msg, s_color = compute_state(pct_hrv, delta_ms, DN_core)
-
-    # =========================
-    # DN SENTINEL (0–2) - ONE NUMBER (matches bar)
-    # =========================
-    # Neutral: 1.0 when %HRV == 0 or INFO
-    # Rise: 1 + TT_pos where TT_pos = clamp(TT_signed, 0..1)
-    # Drop: DN_core (0..1)
-    if state == "INFO" or pct_hrv == 0:
-        DN_sentinel = 1.0
-    elif pct_hrv > 0:
-        TT_pos = clamp(TT_signed, 0.0, 1.0)
-        DN_sentinel = 1.0 + TT_pos
-    else:
-        DN_sentinel = DN_core
-
-    st.session_state["res"] = {
-        "hrv_prev": hrv_prev,
-        "hrv_curr": hrv_curr,
-        "delta_ms": delta_ms,
-        "pct_hrv": pct_hrv,
-        "TT_signed": TT_signed,
-        "DN_core": DN_core,
-        "DN_sentinel": DN_sentinel,
-        "state": state,
-        "msg": msg,
-        "s_color": s_color
+def plot_with_status(minutes, values, statuses, title):
+    # Map status -> marker symbol/outline. Avoid manual colors? User asked "xanh vàng đỏ rõ nét".
+    # Plotly default colors aren't red/yellow/green, so we must set to be clear.
+    # We'll set clear RGB colors.
+    color_map = {
+        "GREEN": "#2ecc71",
+        "INFO": "#3498db",
+        "WARNING": "#f1c40f",
+        "RED": "#e74c3c",
+        "—": "#95a5a6",
     }
+    colors = [color_map.get(s, "#95a5a6") for s in statuses]
 
-res = st.session_state["res"]
-if res is None:
-    st.info("Nhập 2 giá trị HRV rồi bấm **CALCULATE**.")
-    st.stop()
-
-# unpack
-hrv_prev = res["hrv_prev"]
-hrv_curr = res["hrv_curr"]
-delta_ms = res["delta_ms"]
-pct_hrv = res["pct_hrv"]
-DN_sentinel = res["DN_sentinel"]
-DN_core = res["DN_core"]
-state = res["state"]
-msg = res["msg"]
-s_color = res["s_color"]
-
-# =========================
-# MAIN LAYOUT: 2 COLUMNS (LEFT: cards + HRV raw, RIGHT: charts 2 & 3)
-# =========================
-left, right = st.columns([1, 1], gap="large")
-
-with left:
-    # --- cards row (3)
-    a, b, c = st.columns([1, 1, 1], gap="medium")
-
-    with a:
-        st.markdown(
-            f"""
-            <div style="padding:14px;border-radius:12px;background:{C_CARD_BG};">
-              <div style="font-size:12px;opacity:0.7;">%HRV</div>
-              <div style="font-size:34px;font-weight:800;">{pct_hrv:+.1f}%</div>
-              <div style="font-size:12px;opacity:0.65;">ΔHRV = {delta_ms:+.1f} ms</div>
-            </div>
-            """,
-            unsafe_allow_html=True
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=minutes,
+            y=values,
+            mode="lines+markers",
+            marker=dict(size=10, color=colors, line=dict(width=1, color="#2c3e50")),
+            line=dict(width=2),
+            hovertemplate="Minute %{x}<br>Value %{y}<br>Status %{text}<extra></extra>",
+            text=statuses,
         )
-
-    with b:
-        st.markdown(
-            f"""
-            <div style="padding:14px;border-radius:12px;background:{C_CARD_BG};">
-              <div style="font-size:12px;opacity:0.7;">DN Sentinel (0–2)</div>
-              <div style="font-size:34px;font-weight:800;">{DN_sentinel:.3f}</div>
-              <div style="font-size:12px;opacity:0.65;">(same value as the bar)</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with c:
-        st.markdown(
-            f"""
-            <div style="padding:14px;border-radius:12px;background:{s_color};color:#111;">
-              <div style="font-size:12px;font-weight:900;letter-spacing:0.5px;">STATE</div>
-              <div style="font-size:34px;font-weight:900;">{state}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    # message
-    if state == "RED":
-        st.error(msg)
-    elif state == "YELLOW":
-        st.warning(msg)
-    elif state == "INFO":
-        st.info(msg)
-    else:
-        st.success(msg)
-
-    st.caption("Single HRV signal · Time-dynamic processing · No ML · No absolute HRV threshold shown.")
-
-    # =========================
-    # MOVE 1) HRV RAW HERE (UNDER 'Stable' MESSAGE)
-    # =========================
-    st.subheader("1) HRV raw")
-    df_raw = pd.DataFrame({"Time": ["t-1", "t"], "HRV": [hrv_prev, hrv_curr]})
-
-    chart_raw = (
-        alt.Chart(df_raw)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Time:N", sort=["t-1", "t"], title="Time"),
-            y=alt.Y("HRV:Q", title="HRV (ms)", scale=alt.Scale(zero=False))
-        )
-        .properties(height=230)
     )
-    st.altair_chart(chart_raw, use_container_width=True)
-
-with right:
-    # =========================
-    # 2) %HRV diverging bar
-    # =========================
-    st.subheader("2) %HRV (= %TT linear velocity)")
-    df_pct = pd.DataFrame({"label": ["%HRV"], "value": [pct_hrv]})
-
-    # color: rise=GREEN, drop=RED, info=INFO
-    if state == "INFO":
-        v_color = C_INFO
-    else:
-        v_color = C_GREEN if pct_hrv >= 0 else C_RED
-
-    bar = alt.Chart(df_pct).mark_bar(color=v_color, cornerRadius=6).encode(
-        y=alt.Y("label:N", title=""),
-        x=alt.X("value:Q", title="% change",
-                scale=alt.Scale(domain=[-100, 100]),
-                axis=alt.Axis(format=".0f"))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Minute",
+        yaxis_title="Value",
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=320,
     )
-    zero_line = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#333", strokeWidth=2).encode(x="x:Q")
-    txt = alt.Chart(df_pct).mark_text(
-        align="left", dx=8, color="#111", fontSize=16, fontWeight="bold"
-    ).encode(
-        y="label:N", x="value:Q", text=alt.Text("value:Q", format="+.1f")
-    )
-    st.altair_chart((bar + zero_line + txt).properties(height=120), use_container_width=True)
+    return fig
 
-    # =========================
-    # 3) DN Sentinel bar (0–2) + labels + thresholds
-    # =========================
-    st.subheader("3) DN Sentinel (0–2)")
+# -------------------------
+# Core computations per system
+# -------------------------
+def compute_hrv(series):
+    """
+    HRV DN-dynamic (no absolute threshold):
+    pct[i] = %ΔHRV between i-1 and i
+    T = pct/80
+    E = 1 - T^2
+    Basic notes:
+      - step_drop_red: pct <= -40
+      - V-shape: drop <= -20 then next >= +15 and |total over 2 steps| <= 12
+      - noise_brake (optional idea): pct >= +70 (or >= +60ms jump) -> INFO possible noise
+    """
+    N = len(series)
+    pct = [np.nan] * N
+    pct[0] = 0.0
+    for i in range(1, N):
+        pct[i] = pct_change(series[i - 1], series[i])
 
-    # color by STATE
-    if state == "INFO":
-        g_color = C_INFO
-    elif state == "GREEN":
-        g_color = C_GREEN
-    elif state == "YELLOW":
-        g_color = C_YELLOW
-    else:
-        g_color = C_RED
+    T, E, vT, vE = dn_table_from_pct(pct, k=80.0)
 
-    # background bar 0..2
-    bg = alt.Chart(pd.DataFrame({"x0": [0], "x1": [2], "y": ["bar"]})).mark_bar(
-        color=C_BAR_BG, cornerRadius=8
-    ).encode(
-        x=alt.X("x0:Q", scale=alt.Scale(domain=[0, 2]), title=""),
-        x2="x1:Q",
-        y=alt.Y("y:N", title="")
-    )
+    note = [""] * N
+    status = ["—"] * N
+    status[0] = "—"
 
-    # foreground to DN_sentinel
-    fg = alt.Chart(pd.DataFrame({"x0": [0], "x1": [DN_sentinel], "y": ["bar"]})).mark_bar(
-        color=g_color, cornerRadius=8
-    ).encode(x="x0:Q", x2="x1:Q", y="y:N")
+    for i in range(1, N):
+        p = pct[i]
+        if np.isnan(p):
+            status[i] = "—"
+            continue
 
-    # midline at 1.0
-    mid = alt.Chart(pd.DataFrame({"x": [1.0]})).mark_rule(color="#111", strokeWidth=2).encode(x="x:Q")
+        # Step-drop flag (strong)
+        if p <= -40.0:
+            status[i] = "RED"
+            note[i] = "step-drop (≤ -40%)"
+        elif p <= -20.0:
+            status[i] = "WARNING"
+            note[i] = "moderate drop"
+        elif p >= 70.0:
+            status[i] = "INFO"
+            note[i] = "possible noise (fast spike)"
+        else:
+            status[i] = "GREEN"
 
-    # DN thresholds shown on left side for reference (0.85 & 0.95)
-    t85 = alt.Chart(pd.DataFrame({"x": [DN_RED]})).mark_rule(
-        color="#444", strokeDash=[5, 5], strokeWidth=2
-    ).encode(x="x:Q")
-    t95 = alt.Chart(pd.DataFrame({"x": [DN_GREEN]})).mark_rule(
-        color="#444", strokeDash=[5, 5], strokeWidth=2
-    ).encode(x="x:Q")
+    # V-shape recovery tag (overrides to INFO if pattern matches)
+    for i in range(1, N - 1):
+        d1 = pct[i]
+        d2 = pct[i + 1]
+        if np.isnan(d1) or np.isnan(d2):
+            continue
+        total = d1 + d2
+        if (d1 <= -20.0) and (d2 >= 15.0) and (abs(total) <= 12.0):
+            # mark both points for readability
+            status[i] = "INFO"
+            status[i + 1] = "INFO"
+            note[i] = "V-shape (drop→recover)"
+            note[i + 1] = "V-shape (recover)"
 
-    # value label
-    val = alt.Chart(pd.DataFrame({"x": [DN_sentinel], "y": ["bar"], "t": [f"{DN_sentinel:.3f}"]})).mark_text(
-        align="left", dx=8, color="#111", fontSize=16, fontWeight="bold"
-    ).encode(x="x:Q", y="y:N", text="t:N")
-
-    # labels: DROP | NEUTRAL | RECOVERY
-    labels_df = pd.DataFrame({
-        "x": [0.15, 1.0, 1.85],
-        "y": ["bar", "bar", "bar"],
-        "t": ["DROP", "NEUTRAL", "RECOVERY"]
+    df = pd.DataFrame({
+        "Minute": list(range(1, N + 1)),
+        "HRV": series,
+        "%Δ (raw)": np.round(pct, 2),
+        "T (= %Δ/80)": np.round(T, 4),
+        "E (= 1-T²)": np.round(E, 4),
+        "vT": np.round(vT, 4),
+        "vE": np.round(vE, 4),
+        "DN_status": status,
+        "DN_note": note
     })
-    lbl = alt.Chart(labels_df).mark_text(
-        dy=-22, color="#333", fontSize=11, fontWeight="bold"
-    ).encode(x="x:Q", y="y:N", text="t:N")
+    return df, status
 
-    chart_dn = alt.layer(bg, fg, mid, t85, t95, val, lbl).properties(height=130)
-    st.altair_chart(chart_dn, use_container_width=True)
+def compute_spo2(series):
+    """
+    SpO2: use step-delta per minute with k=5:
+      delta = SpO2[i] - SpO2[i-1]
+      T = delta/5
+      E = 1 - T^2 (optional but we keep for consistent table)
+      Status by |T|: RED>=0.6, WARNING>=0.3 else GREEN
+      V-shape filter: (T<=-0.6 and next>=+0.6) -> INFO
+    """
+    N = len(series)
+    delta = [np.nan] * N
+    delta[0] = 0.0
+    for i in range(1, N):
+        delta[i] = series[i] - series[i - 1]
 
-    st.caption("0–1: reserve contraction (DN core) · 1.0: neutral · 1–2: recovery (1 + TT⁺), TT = %HRV/80.")
+    T = np.array(delta, dtype=float) / 5.0
+    E = 1.0 - (T ** 2)
+    vT = np.full_like(T, np.nan, dtype=float)
+    vE = np.full_like(E, np.nan, dtype=float)
+    for i in range(1, N):
+        vT[i] = T[i] - T[i - 1]
+        vE[i] = E[i] - E[i - 1]
+
+    status = ["—"] * N
+    note = [""] * N
+    status[0] = "—"
+    for i in range(1, N):
+        absT = abs(T[i])
+        status[i] = status_from_absT_spo2(absT)
+        if status[i] == "RED":
+            note[i] = "|T|≥0.6"
+        elif status[i] == "WARNING":
+            note[i] = "|T|≥0.3"
+
+    # V-shape (drop then immediate recover)
+    for i in range(1, N - 1):
+        if (T[i] <= -0.6) and (T[i + 1] >= 0.6):
+            status[i] = "INFO"
+            status[i + 1] = "INFO"
+            note[i] = "V-shape (possible artifact)"
+            note[i + 1] = "V-shape (recover)"
+
+    df = pd.DataFrame({
+        "Minute": list(range(1, N + 1)),
+        "SpO2": series,
+        "Δ (raw)": delta,
+        "T (= Δ/5)": np.round(T, 4),
+        "E (= 1-T²)": np.round(E, 4),
+        "vT": np.round(vT, 4),
+        "vE": np.round(vE, 4),
+        "DN_status": status,
+        "DN_note": note
+    })
+    return df, status
+
+def compute_rr(series):
+    """
+    RR: %Δ per minute, k=25:
+      T = %Δ/25 ; E = 1 - T^2
+      Status by |T| (generic): INFO>=0.2, WARNING>=0.5, RED>=1.0
+      V-shape optional tag: big rise then fall quickly -> INFO
+    """
+    N = len(series)
+    pct = [np.nan] * N
+    pct[0] = 0.0
+    for i in range(1, N):
+        pct[i] = pct_change(series[i - 1], series[i])
+
+    T, E, vT, vE = dn_table_from_pct(pct, k=25.0)
+
+    status = ["—"] * N
+    note = [""] * N
+    status[0] = "—"
+    for i in range(1, N):
+        status[i] = status_from_absT(abs(T[i]))
+        if status[i] in ["INFO", "WARNING", "RED"]:
+            note[i] = f"|T|={abs(T[i]):.2f}"
+
+    # simple V-shape filter for RR: up then down strongly (often motion/cough/short artifact)
+    for i in range(1, N - 1):
+        if (T[i] >= 0.8) and (T[i + 1] <= -0.8):
+            status[i] = "INFO"
+            status[i + 1] = "INFO"
+            note[i] = "V-shape (transient)"
+            note[i + 1] = "V-shape (recover)"
+
+    df = pd.DataFrame({
+        "Minute": list(range(1, N + 1)),
+        "RR": series,
+        "%Δ (raw)": np.round(pct, 2),
+        "T (= %Δ/25)": np.round(T, 4),
+        "E (= 1-T²)": np.round(E, 4),
+        "vT": np.round(vT, 4),
+        "vE": np.round(vE, 4),
+        "DN_status": status,
+        "DN_note": note
+    })
+    return df, status
+
+def compute_hr(series):
+    """
+    HR: %Δ per minute, k=15:
+      T = %Δ/15 ; E = 1 - T^2
+      Status by |T|: INFO>=0.2, WARNING>=0.5, RED>=1.0
+    """
+    N = len(series)
+    pct = [np.nan] * N
+    pct[0] = 0.0
+    for i in range(1, N):
+        pct[i] = pct_change(series[i - 1], series[i])
+
+    T, E, vT, vE = dn_table_from_pct(pct, k=15.0)
+
+    status = ["—"] * N
+    note = [""] * N
+    status[0] = "—"
+    for i in range(1, N):
+        status[i] = status_from_absT(abs(T[i]))
+        if status[i] in ["INFO", "WARNING", "RED"]:
+            note[i] = f"|T|={abs(T[i]):.2f}"
+
+    # optional V-shape filter for HR: spike then back (motion artifact)
+    for i in range(1, N - 1):
+        if (T[i] >= 1.0) and (T[i + 1] <= -0.7):
+            status[i] = "INFO"
+            status[i + 1] = "INFO"
+            note[i] = "V-shape (possible artifact)"
+            note[i + 1] = "recover"
+
+    df = pd.DataFrame({
+        "Minute": list(range(1, N + 1)),
+        "HR": series,
+        "%Δ (raw)": np.round(pct, 2),
+        "T (= %Δ/15)": np.round(T, 4),
+        "E (= 1-T²)": np.round(E, 4),
+        "vT": np.round(vT, 4),
+        "vE": np.round(vE, 4),
+        "DN_status": status,
+        "DN_note": note
+    })
+    return df, status
+
+# -------------------------
+# UI
+# -------------------------
+st.title("DN v2 Demo – 4 Systems (10 points each)")
+st.caption("Each tab: input 10 values (1-minute spacing) → click button → table (%Δ vs DN: T, E, vT, vE) + colored chart.")
+
+left, right = st.columns([1, 1])
+with left:
+    st.markdown("**Input format**: 10 numbers separated by spaces. Example: `42 41 40 26 39 38 37 36 35 34`")
+with right:
+    st.markdown("**Constants**: HRV k=80 (dynamic), SpO₂ k=5 (Δ), RR k=25 (%Δ), HR k=15 (%Δ).")
+
+tabs = st.tabs(["HRV (dynamic, no absolute threshold)", "SpO₂ (k=5, |T| thresholds)", "RR (k=25, |T| thresholds)", "HR (k=15, |T| thresholds)"])
+
+# ---- HRV tab
+with tabs[0]:
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        hrv_text = st.text_input("HRV (10 points)", value="42 41 40 26 39 38 37 36 35 34", key="hrv_in")
+        run = st.button("Compute HRV", key="hrv_btn")
+    with c2:
+        st.markdown("**Notes**: DN-dynamic only (step-drop, V-shape, noise-spike). No absolute HRV threshold.")
+
+    if run:
+        try:
+            series = parse_series(hrv_text, 10)
+            df, status = compute_hrv(series)
+            st.dataframe(df, use_container_width=True)
+            fig = plot_with_status(df["Minute"], df["HRV"], df["DN_status"], "HRV – raw series with DN status (per transition into minute)")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+# ---- SpO2 tab
+with tabs[1]:
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        spo2_text = st.text_input("SpO₂ (10 points)", value="98 97 96 95 93 92 93 92 91 92", key="spo2_in")
+        run = st.button("Compute SpO₂", key="spo2_btn")
+    with c2:
+        st.markdown("**Thresholds**: |T|≥0.6 RED, |T|≥0.3 WARNING, V-shape → INFO.  T = Δ/5.")
+
+    if run:
+        try:
+            series = parse_series(spo2_text, 10)
+            df, status = compute_spo2(series)
+            st.dataframe(df, use_container_width=True)
+            fig = plot_with_status(df["Minute"], df["SpO2"], df["DN_status"], "SpO₂ – raw series with DN status (per transition into minute)")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+# ---- RR tab
+with tabs[2]:
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        rr_text = st.text_input("RR (10 points)", value="16 16 17 17 18 18 19 19 21 21", key="rr_in")
+        run = st.button("Compute RR", key="rr_btn")
+    with c2:
+        st.markdown("**Thresholds**: |T|≥1 RED, |T|≥0.5 WARNING, |T|≥0.2 INFO.  T = %Δ/25.")
+
+    if run:
+        try:
+            series = parse_series(rr_text, 10)
+            df, status = compute_rr(series)
+            st.dataframe(df, use_container_width=True)
+            fig = plot_with_status(df["Minute"], df["RR"], df["DN_status"], "RR – raw series with DN status (per transition into minute)")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+# ---- HR tab
+with tabs[3]:
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        hr_text = st.text_input("HR (10 points)", value="82 83 84 118 86 87 88 89 90 91", key="hr_in")
+        run = st.button("Compute HR", key="hr_btn")
+    with c2:
+        st.markdown("**Thresholds**: |T|≥1 RED, |T|≥0.5 WARNING, |T|≥0.2 INFO.  T = %Δ/15.")
+
+    if run:
+        try:
+            series = parse_series(hr_text, 10)
+            df, status = compute_hr(series)
+            st.dataframe(df, use_container_width=True)
+            fig = plot_with_status(df["Minute"], df["HR"], df["DN_status"], "HR – raw series with DN status (per transition into minute)")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
+
+st.markdown("---")
+st.markdown("Tip: For SSRN v2, use the **table output** as Appendix (10-point sequences) and keep main text on **transition tables (5 transitions)**.")
