@@ -1,12 +1,14 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
+
+st.set_page_config(page_title="DN v2 Demo", layout="wide")
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def parse_10_numbers(text: str) -> list[float]:
+# -----------------------------
+# Parsing
+# -----------------------------
+def parse_10_numbers(text: str):
     parts = [p for p in text.replace(",", " ").split() if p.strip() != ""]
     vals = [float(p) for p in parts]
     if len(vals) != 10:
@@ -14,190 +16,221 @@ def parse_10_numbers(text: str) -> list[float]:
     return vals
 
 
-def lorentz_from_t(t: np.ndarray) -> np.ndarray:
-    # core math, do NOT display formula in UI
-    return 1.0 - (t ** 2)
-
-
-def compute_table(values: list[float], mode: str) -> pd.DataFrame:
+# -----------------------------
+# Core math (hidden from UI text)
+# -----------------------------
+def compute_series(values, mode: str):
     """
-    mode in {"HRV","SPO2","RR","HR"}.
-    Returns dataframe with columns:
-    minute, value, t, e, vT, vE, status, note
+    Returns dataframe columns:
+    minute, value, t, e, vt, ve, status(BASE/PATTERN), note
     """
+
     v = np.array(values, dtype=float)
     n = len(v)
 
-    # minute index 1..10
-    minute = np.arange(1, n + 1, dtype=int)
-
-    # step change
-    if mode == "SPO2":
-        # absolute delta in percentage-points
-        delta = np.zeros(n, dtype=float)
-        delta[1:] = v[1:] - v[:-1]
-        # normalize with k=5 (hidden)
-        t = delta / 5.0
-    elif mode == "HRV":
-        pct = np.zeros(n, dtype=float)
-        pct[1:] = 100.0 * (v[1:] - v[:-1]) / np.where(v[:-1] == 0, np.nan, v[:-1])
-        pct = np.nan_to_num(pct, nan=0.0, posinf=0.0, neginf=0.0)
-        # normalize with K=80 (hidden)
-        t = pct / 80.0
-    elif mode == "RR":
-        pct = np.zeros(n, dtype=float)
-        pct[1:] = 100.0 * (v[1:] - v[:-1]) / np.where(v[:-1] == 0, np.nan, v[:-1])
-        pct = np.nan_to_num(pct, nan=0.0, posinf=0.0, neginf=0.0)
-        # normalize with K=25 (hidden)
-        t = pct / 25.0
-    elif mode == "HR":
-        pct = np.zeros(n, dtype=float)
-        pct[1:] = 100.0 * (v[1:] - v[:-1]) / np.where(v[:-1] == 0, np.nan, v[:-1])
-        pct = np.nan_to_num(pct, nan=0.0, posinf=0.0, neginf=0.0)
-        # normalize with K=15 (hidden)
-        t = pct / 15.0
+    # Step signal per mode
+    if mode == "spo2":
+        # absolute delta for SpO2 (% points)
+        step = np.zeros(n, dtype=float)
+        step[1:] = v[1:] - v[:-1]
+        # Normalize with K=5 (per your image)
+        t = np.zeros(n, dtype=float)
+        t[1:] = step[1:] / 5.0
     else:
-        raise ValueError("Unknown mode.")
+        # percent delta for HRV/RR/HR
+        step = np.zeros(n, dtype=float)
+        step[1:] = 100.0 * (v[1:] - v[:-1]) / np.where(v[:-1] == 0, np.nan, v[:-1])
 
-    e = lorentz_from_t(t)
+        if mode == "hrv":
+            k = 80.0
+        elif mode == "rr":
+            k = 25.0
+        elif mode == "hr":
+            k = 15.0
+        else:
+            k = 80.0
 
-    vT = np.zeros(n, dtype=float)
-    vE = np.zeros(n, dtype=float)
-    vT[1:] = t[1:] - t[:-1]
-    vE[1:] = e[1:] - e[:-1]
+        t = np.zeros(n, dtype=float)
+        t[1:] = step[1:] / k
 
-    status = np.array(["GREEN"] * n, dtype=object)
-    note = np.array([""] * n, dtype=object)
+    # Lorentz-like energy
+    e = np.zeros(n, dtype=float)
+    e[:] = 1.0 - (t ** 2)
 
-    # -------------------------
-    # Status logic (paper-clean)
-    # -------------------------
-    if mode in {"SPO2", "RR", "HR"}:
-        # threshold on |t| (hidden), applied to dynamic only
-        abs_t = np.abs(t)
+    # Derivatives
+    vt = np.zeros(n, dtype=float)
+    ve = np.zeros(n, dtype=float)
+    vt[1:] = t[1:] - t[:-1]
+    ve[1:] = e[1:] - e[:-1]
 
-        status[abs_t >= 0.6] = "RED"
-        status[(abs_t >= 0.3) & (abs_t < 0.6)] = "WARNING"
+    # Notes + status
+    note = [""] * n
+    status = ["BASE"] * n
 
-        # add short reason only when not GREEN
-        for i in range(n):
-            if status[i] == "RED":
-                note[i] = "threshold-hit"
-            elif status[i] == "WARNING":
-                note[i] = "threshold-hit"
-
-        # V-shape filter (drop then immediate recovery)
-        # If (i) is a drop (t negative strong) and (i+1) rebounds positive strong -> mark both as INFO
-        for i in range(1, n - 1):
-            if (t[i] <= -0.3) and (t[i + 1] >= 0.3):
-                status[i] = "INFO"
-                status[i + 1] = "INFO"
-                note[i] = "V-shape"
-                note[i + 1] = "V-shape"
-
-    elif mode == "HRV":
-        # HRV: no absolute HRV threshold; only dynamic patterns
-
-        # Step-drop rule (dynamic, not absolute): pct <= -40% -> RED
-        # (This is still pattern-based, not baseline-based.)
-        pct = np.zeros(n, dtype=float)
-        pct[1:] = 100.0 * (v[1:] - v[:-1]) / np.where(v[:-1] == 0, np.nan, v[:-1])
-        pct = np.nan_to_num(pct, nan=0.0, posinf=0.0, neginf=0.0)
-
+    if mode == "hrv":
+        # --- HRV: NO absolute threshold, only patterns ---
+        # step-drop (your earlier core idea: pct step <= -40%)
         for i in range(1, n):
-            if pct[i] <= -40.0:
-                status[i] = "RED"
+            if step[i] <= -40.0:
                 note[i] = "step-drop"
+                status[i] = "PATTERN"
 
-        # Noise-brake: very fast positive spike -> INFO (possible sensor noise)
-        # Fix: everything scalar/array-safe
-        delta_ms = np.zeros(n, dtype=float)
-        delta_ms[1:] = v[1:] - v[:-1]
-
-        noise_mask = (pct >= 70.0) | (np.abs(delta_ms) >= 60.0)
-        # ignore minute 1
-        noise_mask[0] = False
-
-        for i in range(n):
-            if noise_mask[i]:
-                status[i] = "INFO"
+        # noise-spike brake (v1.5 idea): fast jump (>=70% OR >=60 ms)
+        for i in range(1, n):
+            abs_ms = abs(v[i] - v[i - 1])
+            if (step[i] >= 70.0) or (abs_ms >= 60.0):
+                # override to noise note
                 note[i] = "noise-spike"
+                status[i] = "PATTERN"
 
-        # V-shape recovery (dynamic): drop then rebound, downgrade to INFO if it looks like transient artifact/recovery
-        # Criteria: pct[i] <= -20 and pct[i+1] >= +15 and |(v[i+1]-v[i-1])/v[i-1]| <= 12%
-        for i in range(1, n - 1):
-            total_pct = 0.0
-            if v[i - 1] != 0:
-                total_pct = 100.0 * (v[i + 1] - v[i - 1]) / v[i - 1]
-            if (pct[i] <= -20.0) and (pct[i + 1] >= 15.0) and (abs(total_pct) <= 12.0):
-                status[i] = "INFO"
-                status[i + 1] = "INFO"
-                note[i] = "V-shape"
-                note[i + 1] = "V-shape"
-
-        # Drift-down hint (paper-friendly): small persistent negatives -> keep GREEN but note "drift"
-        # Only annotate, do not escalate.
+        # V-shape recovery (core v1 logic adapted to 10 points)
+        # condition on two consecutive step-% (d1 then d2)
         for i in range(2, n):
-            if (pct[i] < 0) and (pct[i - 1] < 0) and status[i] == "GREEN":
-                note[i] = "drift-down"
+            d1 = step[i - 1]
+            d2 = step[i]
+            total = d1 + d2
+            if (d1 <= -20.0) and (d2 >= 15.0) and (abs(total) <= 12.0):
+                # mark the recovery point (i) as v-shape
+                note[i] = "v-shape"
+                status[i] = "PATTERN"
 
-        # Minute 1 is always baseline row
-        status[0] = "GREEN"
-        if note[0] == "":
-            note[0] = ""
+        # drift-down / drift-up (simple monotone trend flag; still "pattern", not ICU alert)
+        # 4 consecutive negatives (or positives) beyond tiny noise
+        for i in range(4,_toggle := 4, ):
+            pass  # just to avoid lint in some editors
 
-    df = pd.DataFrame(
-        {
-            "minute": minute,
-            "value": v,
-            "t": np.round(t, 4),
-            "e": np.round(e, 4),
-            "vT": np.round(vT, 4),
-            "vE": np.round(vE, 4),
-            "status": status,
-            "note": note,
-        }
-    )
+        for i in range(4, n):
+            window = step[i - 3:i + 1]  # 4 steps (includes current)
+            if np.all(window < -1.0):
+                # don't overwrite a stronger note like step-drop/noise/v-shape
+                if note[i] == "":
+                    note[i] = "drift-down"
+                    status[i] = "PATTERN"
+            if np.all(window > 1.0):
+                if note[i] == "":
+                    note[i] = "drift-up"
+                    status[i] = "PATTERN"
+
+    else:
+        # --- SpO2 / RR / HR: keep |T| thresholds like your image ---
+        # SpO2: |T|>=0.6 RED; |T|>=0.3 WARNING; V-shape -> INFO
+        # RR:   |T|>=1.0 RED; |T|>=0.5 WARNING; |T|>=0.2 mild (optional)
+        # HR:   |T|>=1.0 RED; |T|>=0.6 WARNING; |T|>=0.3 mild (optional)
+
+        if mode == "spo2":
+            red_thr = 0.6
+            warn_thr = 0.3
+
+            for i in range(1, n):
+                if abs(t[i]) >= red_thr:
+                    note[i] = "RED"
+                    status[i] = "PATTERN"
+                elif abs(t[i]) >= warn_thr:
+                    note[i] = "WARNING"
+                    status[i] = "PATTERN"
+
+            # V-shape (drop then immediate recovery) -> INFO (filter false alert)
+            for i in range(2, n):
+                if (t[i - 1] <= -red_thr) and (t[i] >= red_thr) and (abs(t[i - 1] + t[i]) <= 0.2):
+                    note[i] = "INFO (v-shape)"
+                    status[i] = "PATTERN"
+
+        elif mode == "rr":
+            red_thr = 1.0
+            warn_thr = 0.5
+            mild_thr = 0.2  # aligns with your "5–8% => |T| ~0.2–0.3" note
+
+            for i in range(1, n):
+                if abs(t[i]) >= red_thr:
+                    note[i] = "RED"
+                    status[i] = "PATTERN"
+                elif abs(t[i]) >= warn_thr:
+                    note[i] = "WARNING"
+                    status[i] = "PATTERN"
+                elif abs(t[i]) >= mild_thr:
+                    note[i] = "MILD"
+                    status[i] = "PATTERN"
+
+            # Optional V-shape for RR as noise/position artifact filter
+            for i in range(2, n):
+                if (abs(t[i - 1]) >= warn_thr) and (abs(t[i]) >= warn_thr) and (abs(t[i - 1] + t[i]) <= 0.2):
+                    note[i] = "INFO (v-shape)"
+                    status[i] = "PATTERN"
+
+        elif mode == "hr":
+            red_thr = 1.0
+            warn_thr = 0.6
+            mild_thr = 0.3
+
+            for i in range(1, n):
+                if abs(t[i]) >= red_thr:
+                    note[i] = "RED"
+                    status[i] = "PATTERN"
+                elif abs(t[i]) >= warn_thr:
+                    note[i] = "WARNING"
+                    status[i] = "PATTERN"
+                elif abs(t[i]) >= mild_thr:
+                    note[i] = "MILD"
+                    status[i] = "PATTERN"
+
+            for i in range(2, n):
+                if (abs(t[i - 1]) >= warn_thr) and (abs(t[i]) >= warn_thr) and (abs(t[i - 1] + t[i]) <= 0.2):
+                    note[i] = "INFO (v-shape)"
+                    status[i] = "PATTERN"
+
+    df = pd.DataFrame({
+        "minute": np.arange(1, n + 1),
+        "value": v,
+        "t": np.round(t, 4),
+        "e": np.round(e, 4),
+        "vt": np.round(vt, 4),
+        "ve": np.round(ve, 4),
+        "status": status,
+        "note": note
+    })
     return df
 
 
 def render_tab(tab_name: str, default_text: str, mode: str):
-    st.subheader(f"{tab_name} (10 points)")
-    txt = st.text_input("", value=default_text, key=f"inp_{mode}")
-    if st.button("Compute", key=f"btn_{mode}"):
-        try:
-            values = parse_10_numbers(txt)
-            df = compute_table(values, mode=mode)
+    text = st.text_input("", value=default_text, key=f"in_{mode}")
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run = st.button("Compute", key=f"btn_{mode}")
+    with col2:
+        st.write("")  # keep clean
 
-            st.dataframe(df, use_container_width=True)
+    if run:
+        try:
+            values = parse_10_numbers(text)
+            df = compute_series(values, mode=mode)
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
             csv = df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download CSV",
                 data=csv,
-                file_name=f"DN_v2_{mode}.csv",
+                file_name=f"dn_v2_{mode}.csv",
                 mime="text/csv",
-                key=f"dl_{mode}",
+                key=f"dl_{mode}"
             )
         except Exception as ex:
             st.error(str(ex))
 
 
-# -------------------------
-# UI
-# -------------------------
-st.set_page_config(page_title="DN v2 Demo", layout="wide")
-
 tabs = st.tabs(["hrv", "spo2", "rr", "hr"])
 
 with tabs[0]:
-    render_tab("HRV", "50 49 48 47 46 45 44 43 42 41", "HRV")
+    st.subheader("HRV (10 points)")
+    render_tab("HRV", "50 49 48 47 46 45 44 43 42 41", mode="hrv")
 
 with tabs[1]:
-    render_tab("SpO2", "98 97 96 95 94 93 92 91 90 89", "SPO2")
+    st.subheader("SpO2 (10 points)")
+    render_tab("SpO2", "98 97 96 95 94 93 92 91 90 89", mode="spo2")
 
 with tabs[2]:
-    render_tab("RR", "16 17 18 19 21 23 25 28 31 34", "RR")
+    st.subheader("RR (10 points)")
+    render_tab("RR", "16 16 17 18 20 22 21 20 19 18", mode="rr")
 
 with tabs[3]:
-    render_tab("HR", "75 76 110 77 78 82 88 95 103 112", "HR")
+    st.subheader("HR (10 points)")
+    render_tab("HR", "75 76 110 77 78 82 88 95 103 112", mode="hr")
